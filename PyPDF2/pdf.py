@@ -46,6 +46,7 @@ import string
 import math
 import struct
 import sys
+import uuid
 from sys import version_info
 if version_info < ( 3, 0 ):
     from cStringIO import StringIO
@@ -225,8 +226,22 @@ class PdfFileWriter(object):
                 NameObject("/S"): NameObject("/JavaScript"),
                 NameObject("/JS"): NameObject("(%s)" % javascript)
                 })
+        js_indirect_object = self._addObject(js)
+
+        # We need a name for parameterized javascript in the pdf file, but it can be anything.
+        js_string_name = str(uuid.uuid4())
+
+        js_name_tree = DictionaryObject()
+        js_name_tree.update({
+                NameObject("/JavaScript"): DictionaryObject({
+                  NameObject("/Names"): ArrayObject([createStringObject(js_string_name), js_indirect_object])
+                })
+              })
+        self._addObject(js_name_tree)
+
         self._root_object.update({
-                NameObject("/OpenAction"): self._addObject(js)
+                NameObject("/OpenAction"): js_indirect_object,
+                NameObject("/Names"): js_name_tree
                 })
 
     def addAttachment(self, fname, fdata):
@@ -470,6 +485,7 @@ class PdfFileWriter(object):
         # Begin writing:
         object_positions = []
         stream.write(self._header + b_("\n"))
+        stream.write(b_("%\xE2\xE3\xCF\xD3\n"))
         for i in range(len(self._objects)):
             idnum = (i + 1)
             obj = self._objects[i]
@@ -556,20 +572,29 @@ class PdfFileWriter(object):
                     self._sweepIndirectReferences(externMap, realdata)
                     return data
             else:
+                if data.pdf.stream.closed:
+                    raise ValueError("I/O operation on closed file: {}".format(data.pdf.stream.name))
                 newobj = externMap.get(data.pdf, {}).get(data.generation, {}).get(data.idnum, None)
                 if newobj == None:
-                    newobj = data.pdf.getObject(data)
-                    self._objects.append(None) # placeholder
-                    idnum = len(self._objects)
-                    newobj_ido = IndirectObject(idnum, 0, self)
-                    if data.pdf not in externMap:
-                        externMap[data.pdf] = {}
-                    if data.generation not in externMap[data.pdf]:
-                        externMap[data.pdf][data.generation] = {}
-                    externMap[data.pdf][data.generation][data.idnum] = newobj_ido
-                    newobj = self._sweepIndirectReferences(externMap, newobj)
-                    self._objects[idnum-1] = newobj
-                    return newobj_ido
+                    try:
+                        newobj = data.pdf.getObject(data)
+                        self._objects.append(None) # placeholder
+                        idnum = len(self._objects)
+                        newobj_ido = IndirectObject(idnum, 0, self)
+                        if data.pdf not in externMap:
+                            externMap[data.pdf] = {}
+                        if data.generation not in externMap[data.pdf]:
+                            externMap[data.pdf][data.generation] = {}
+                        externMap[data.pdf][data.generation][data.idnum] = newobj_ido
+                        newobj = self._sweepIndirectReferences(externMap, newobj)
+                        self._objects[idnum-1] = newobj
+                        return newobj_ido
+                    except ValueError:
+                        # Unable to resolve the Object, returning NullObject instead.
+                        warnings.warn("Unable to resolve [{}: {}], returning NullObject instead".format(
+                            data.__class__.__name__, data
+                        ))
+                        return NullObject()
                 return newobj
         else:
             return data
@@ -870,6 +895,64 @@ class PdfFileWriter(object):
                                 operands[0][i] = TextStringObject()
 
             pageRef.__setitem__(NameObject('/Contents'), content)
+
+    def addURI(self, pagenum, uri, rect, border=None):
+        """
+        Add an URI from a rectangular area to the specified page.
+        This uses the basic structure of AddLink
+
+        :param int pagenum: index of the page on which to place the URI action.
+        :param int uri: string -- uri of resource to link to.
+        :param rect: :class:`RectangleObject<PyPDF2.generic.RectangleObject>` or array of four
+            integers specifying the clickable rectangular area
+            ``[xLL, yLL, xUR, yUR]``, or string in the form ``"[ xLL yLL xUR yUR ]"``.
+        :param border: if provided, an array describing border-drawing
+            properties. See the PDF spec for details. No border will be
+            drawn if this argument is omitted.
+
+        REMOVED FIT/ZOOM ARG
+        -John Mulligan
+        """
+
+        pageLink = self.getObject(self._pages)['/Kids'][pagenum]
+        pageRef = self.getObject(pageLink)
+
+        if border is not None:
+            borderArr = [NameObject(n) for n in border[:3]]
+            if len(border) == 4:
+                dashPattern = ArrayObject([NameObject(n) for n in border[3]])
+                borderArr.append(dashPattern)
+        else:
+            borderArr = [NumberObject(2)] * 3
+
+        if isString(rect):
+            rect = NameObject(rect)
+        elif isinstance(rect, RectangleObject):
+            pass
+        else:
+            rect = RectangleObject(rect)
+
+        lnk2 = DictionaryObject()
+        lnk2.update({
+        NameObject('/S'): NameObject('/URI'),
+        NameObject('/URI'): TextStringObject(uri)
+        });
+        lnk = DictionaryObject()
+        lnk.update({
+        NameObject('/Type'): NameObject('/Annot'),
+        NameObject('/Subtype'): NameObject('/Link'),
+        NameObject('/P'): pageLink,
+        NameObject('/Rect'): rect,
+        NameObject('/H'): NameObject('/I'),
+        NameObject('/Border'): ArrayObject(borderArr),
+        NameObject('/A'): lnk2
+        })
+        lnkRef = self._addObject(lnk)
+
+        if "/Annots" in pageRef:
+            pageRef['/Annots'].append(lnkRef)
+        else:
+            pageRef[NameObject('/Annots')] = ArrayObject([lnkRef])
 
     def addLink(self, pagenum, pagedest, rect, border=None, fit='/Fit', *args):
         """
@@ -1242,6 +1325,16 @@ class PdfFileReader(object):
             except KeyError:
                 # Field attribute is N/A or unknown, so don't write anything
                 pass
+
+    def getFormTextFields(self):
+        ''' Retrieves form fields from the document with textual data (inputs, dropdowns)
+        '''
+        # Retrieve document form fields
+        formfields = self.getFields()
+        return dict(
+            (formfields[field]['/T'], formfields[field].get('/V')) for field in formfields \
+                if formfields[field].get('/FT') == '/Tx'
+        )
 
     def getNamedDestinations(self, tree=None, retval=None):
         """
@@ -1692,10 +1785,10 @@ class PdfFileReader(object):
                     num = readObject(stream, self)
                     if firsttime and num != 0:
                          self.xrefIndex = num
-                         warnings.warn("Xref table not zero-indexed. ID numbers for objects will %sbe corrected." % \
-                                       ("" if not self.strict else "not "), utils.PdfReadWarning)
-                         #if table not zero indexed, could be due to error from when PDF was created
-                         #which will lead to mismatched indices later on
+                         if self.strict:
+                            warnings.warn("Xref table not zero-indexed. ID numbers for objects will be corrected.", utils.PdfReadWarning)
+                            #if table not zero indexed, could be due to error from when PDF was created
+                            #which will lead to mismatched indices later on, only warned and corrected if self.strict=True
                     firsttime = False
                     readNonWhitespace(stream)
                     stream.seek(-1, 1)
@@ -1953,7 +2046,7 @@ class PdfFileReader(object):
         if encrypt['/Filter'] != '/Standard':
             raise NotImplementedError("only Standard PDF encryption handler is available")
         if not (encrypt['/V'] in (1, 2)):
-            raise NotImplementedError("only algorithm code 1 and 2 are supported")
+            raise NotImplementedError("only algorithm code 1 and 2 are supported. This PDF uses code %s" % encrypt['/V'])
         user_password, key = self._authenticateUserPassword(password)
         if user_password:
             self._decryption_key = key
@@ -2627,7 +2720,7 @@ class ContentStream(DecodedStreamObject):
         if isinstance(stream, ArrayObject):
             data = b_("")
             for s in stream:
-                data += s.getObject().getData()
+                data += b_(s.getObject().getData())
             stream = BytesIO(b_(data))
         else:
             stream = BytesIO(b_(stream.getData()))
@@ -2691,13 +2784,16 @@ class ContentStream(DecodedStreamObject):
                 # Check for End Image
                 tok2 = stream.read(1)
                 if tok2 == b_("I"):
-                    # Sometimes that data will contain EI, so check for the Q operator.
+                    # Data can contain EI, so check for the Q operator.
                     tok3 = stream.read(1)
                     info = tok + tok2
+                    # We need to find whitespace between EI and Q.
+                    has_q_whitespace = False
                     while tok3 in utils.WHITESPACES:
+                        has_q_whitespace = True
                         info += tok3
                         tok3 = stream.read(1)
-                    if tok3 == b_("Q"):
+                    if tok3 == b_("Q") and has_q_whitespace:
                         stream.seek(-1, 1)
                         break
                     else:
@@ -2713,14 +2809,14 @@ class ContentStream(DecodedStreamObject):
     def _getData(self):
         newdata = BytesIO()
         for operands, operator in self.operations:
-            if operator == "INLINE IMAGE":
-                newdata.write("BI")
-                dicttext = StringIO()
+            if operator == b_("INLINE IMAGE"):
+                newdata.write(b_("BI"))
+                dicttext = BytesIO()
                 operands["settings"].writeToStream(dicttext, None)
                 newdata.write(dicttext.getvalue()[2:-2])
-                newdata.write("ID ")
+                newdata.write(b_("ID "))
                 newdata.write(operands["data"])
-                newdata.write("EI")
+                newdata.write(b_("EI"))
             else:
                 for op in operands:
                     op.writeToStream(newdata, None)
